@@ -49,9 +49,13 @@ fn run_test(
     #[base_dir = "src/transforms/externref/tests"]
     #[files("*.wat")]
     test: PathBuf,
+    #[values(1, 4)] threads: usize,
 ) -> Result<()> {
     let expected = Test::from_file(&test)?;
-    let actual = runtest(&expected)?;
+    let actual = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()?
+        .install(|| runtest(&expected))?;
     expected.check(&actual)
 }
 

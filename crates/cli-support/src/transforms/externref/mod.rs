@@ -16,6 +16,7 @@
 //! `externref` and valid Wasm modules going out which use `externref` at the fringes.
 
 use anyhow::{anyhow, bail, Context as _, Error};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::wasm_conventions;
@@ -379,6 +380,7 @@ impl Transform<'_> {
         let (is_export, ty) = match &target.kind {
             walrus::FunctionKind::Import(f) => (false, f.ty),
             walrus::FunctionKind::Local(f) => (true, f.ty()),
+            walrus::FunctionKind::Encoded(f) => (true, f.ty()),
             _ => unreachable!(),
         };
 
@@ -599,22 +601,31 @@ impl Transform<'_> {
     }
 
     fn rewrite_calls(&mut self, module: &mut Module) -> Result<(), Error> {
-        for (id, func) in module.funcs.iter_local_mut() {
-            if self.shims.contains(&id) {
-                continue;
-            }
-            let entry = func.entry_block();
-            let scratch_i32 = module.locals.add(ValType::I32);
-            dfs_pre_order_mut(
-                &mut Rewrite {
-                    clone_ref: self.clone_ref()?,
-                    heap_dealloc: self.heap_dealloc()?,
-                    xform: self,
-                    scratch_i32,
-                },
-                func,
-                entry,
-            );
+        // Allocate locals in arena order before handing independent function
+        // bodies to workers. Shared transform metadata is read-only here.
+        let funcs: Vec<_> = module
+            .funcs
+            .iter_local_mut()
+            .filter(|(id, _)| !self.shims.contains(id))
+            .map(|(_, func)| (func, module.locals.add(ValType::I32)))
+            .collect();
+        if !funcs.is_empty() {
+            let clone_ref = self.clone_ref()?;
+            let heap_dealloc = self.heap_dealloc()?;
+            let xform = &*self;
+            funcs.into_par_iter().for_each(|(func, scratch_i32)| {
+                let entry = func.entry_block();
+                dfs_pre_order_mut(
+                    &mut Rewrite {
+                        clone_ref,
+                        heap_dealloc,
+                        xform,
+                        scratch_i32,
+                    },
+                    func,
+                    entry,
+                );
+            });
         }
 
         return Ok(());

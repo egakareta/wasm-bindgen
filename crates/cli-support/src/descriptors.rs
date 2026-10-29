@@ -13,6 +13,7 @@
 use crate::descriptor::{Descriptor, GenericImportKey};
 use crate::interpreter::Interpreter;
 use anyhow::{bail, Error};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::hash_map::HashMap;
 use walrus::{CustomSection, FunctionId, Module, TypedCustomSectionId};
@@ -98,17 +99,21 @@ impl WasmBindgenDescriptorsSection {
             None => return Ok(()),
         };
 
-        let mut generic_funcs = Vec::new();
-        for (func_id, local) in module.funcs.iter_local() {
-            let mut find = FindDescribeGenericImport {
-                wbindgen_describe_generic_import,
-                calls: 0,
-            };
-            dfs_in_order(&mut find, local, local.entry_block());
-            if find.calls > 0 {
-                generic_funcs.push((func_id, find.calls));
-            }
-        }
+        // Discovery is read-only. Interpret in arena order below so parallel
+        // scheduling cannot change diagnostics or binding generation order.
+        let mut generic_funcs: Vec<_> = module
+            .funcs
+            .par_iter_local()
+            .filter_map(|(func_id, local)| {
+                let mut find = FindDescribeGenericImport {
+                    wbindgen_describe_generic_import,
+                    calls: 0,
+                };
+                dfs_in_order(&mut find, local, local.entry_block());
+                (find.calls > 0).then_some((func_id, find.calls))
+            })
+            .collect();
+        generic_funcs.sort_unstable_by_key(|(id, _)| id.index());
         for (func_id, calls) in generic_funcs {
             // `interpret_descriptor` stops at the first marker call, so a second
             // one in the same function would be silently dropped and every call

@@ -7,6 +7,7 @@ use crate::{
     decode, wasm_conventions, Bindgen, INITIAL_HEAP_OFFSET, INITIAL_HEAP_VALUES, PLACEHOLDER_MODULE,
 };
 use anyhow::{anyhow, bail, ensure, Context as _, Error};
+use rayon::prelude::*;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str;
@@ -761,11 +762,15 @@ impl<'a> Context<'a> {
                 }
             }
         }
+        self.module
+            .funcs
+            .par_iter_local_mut()
+            .for_each(|(_, func)| {
+                let mut replace = Replace { map };
+                let entry = func.entry_block();
+                walrus::ir::dfs_pre_order_mut(&mut replace, func, entry);
+            });
         let mut replace = Replace { map };
-        for (_id, func) in self.module.funcs.iter_local_mut() {
-            let entry = func.entry_block();
-            walrus::ir::dfs_pre_order_mut(&mut replace, func, entry);
-        }
         for elems in self.module.elements.iter_mut() {
             match &mut elems.items {
                 ElementItems::Functions(funcs) => {

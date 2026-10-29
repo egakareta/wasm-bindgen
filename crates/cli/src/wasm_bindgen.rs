@@ -168,6 +168,8 @@ where
 
 fn rmain(args: &Args) -> Result<(), Error> {
     let mut b = Bindgen::new();
+    b.preserve_original_code_metadata(false)
+        .preserve_encoded_bodies(true);
     match &args.target {
         Target::Bundler => b.bundler(true)?,
         Target::Web => b.web(true)?,

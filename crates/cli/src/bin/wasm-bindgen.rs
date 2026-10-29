@@ -1,3 +1,7 @@
+#[cfg(not(target_family = "wasm"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{env, process};
 
 fn main() {

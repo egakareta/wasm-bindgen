@@ -6,6 +6,7 @@ pub mod jspi_hooks;
 pub mod multi_value;
 pub mod threads;
 
+use rayon::prelude::*;
 use walrus::ir::{Try, TryTable, Visitor};
 
 /// Returns true if the module has local exception tags (indicating exception handling support).
@@ -60,26 +61,20 @@ pub fn detect_exception_handling_version(
         }
     }
 
-    let mut detector = EhDetector {
-        has_try: false,
-        has_try_table: false,
-    };
-
-    for func in module.funcs.iter() {
-        if let walrus::FunctionKind::Local(local) = &func.kind {
+    let (has_try, has_try_table) = module
+        .funcs
+        .par_iter_local()
+        .map(|(_, local)| {
+            let mut detector = EhDetector {
+                has_try: false,
+                has_try_table: false,
+            };
             walrus::ir::dfs_in_order(&mut detector, local, local.entry_block());
-        }
-        // Early exit if we've found both
-        if detector.has_try && detector.has_try_table {
-            break;
-        }
-    }
+            (detector.has_try, detector.has_try_table)
+        })
+        .reduce(|| (false, false), |a, b| (a.0 || b.0, a.1 || b.1));
 
-    match (
-        detector.has_try_table,
-        detector.has_try,
-        enable_abort_handler,
-    ) {
+    match (has_try_table, has_try, enable_abort_handler) {
         (true, _, _) => ExceptionHandlingVersion::Modern,
         (false, true, _) => ExceptionHandlingVersion::Legacy,
         (false, false, true) => ExceptionHandlingVersion::ModernButWithPanicAbort,

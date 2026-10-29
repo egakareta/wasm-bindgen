@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Error};
+use rayon::prelude::*;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -44,6 +45,8 @@ pub struct Bindgen {
     keep_lld_exports: bool,
     export_wasm: bool,
     keep_debug: bool,
+    preserve_original_code_metadata: bool,
+    preserve_encoded_bodies: bool,
     split_debug_info: bool,
     debug_info_url: Option<String>,
     remove_name_section: bool,
@@ -126,6 +129,8 @@ impl Bindgen {
             keep_lld_exports: false,
             export_wasm: false,
             keep_debug: false,
+            preserve_original_code_metadata: true,
+            preserve_encoded_bodies: false,
             split_debug_info: false,
             debug_info_url: None,
             remove_name_section: false,
@@ -293,6 +298,22 @@ impl Bindgen {
     /// Exports the instance's exports as `__wasm`, as `debug` also does.
     pub fn export_wasm(&mut self, export_wasm: bool) -> &mut Bindgen {
         self.export_wasm = export_wasm;
+        self
+    }
+
+    /// Avoid constructing instruction IR for validated functions whose bodies
+    /// the binding transforms cannot modify. Library callers opt in explicitly.
+    pub fn preserve_encoded_bodies(&mut self, preserve: bool) -> &mut Bindgen {
+        self.preserve_encoded_bodies = preserve;
+        self
+    }
+
+    /// Retain original code offsets and input DWARF for callers inspecting the
+    /// returned module. Enabled by default for library compatibility. The CLI
+    /// disables this when only generated files are needed; DWARF output still
+    /// retains the metadata required to generate it.
+    pub fn preserve_original_code_metadata(&mut self, preserve: bool) -> &mut Bindgen {
+        self.preserve_original_code_metadata = preserve;
         self
     }
 
@@ -665,6 +686,11 @@ impl Bindgen {
             // validation!
             .strict_validate(false)
             .generate_dwarf(self.keep_debug || self.split_debug_info)
+            .preserve_original_code_metadata(self.preserve_original_code_metadata)
+            .preserve_encoded_bodies(
+                self.preserve_encoded_bodies
+                    .then_some(encoded_inspection_roots),
+            )
             .generate_name_section(!self.remove_name_section)
             .generate_producers_section(!self.remove_producers_section)
             .parse(bytes)
@@ -682,6 +708,43 @@ impl Bindgen {
     ) -> String {
         format!("./snippets/{unique_crate_identifier}/inline{snippet_idx_in_crate}.js",)
     }
+}
+
+fn encoded_inspection_roots(module: &Module) -> Vec<walrus::FunctionId> {
+    // Emscripten's invoke trampolines let descriptor interpretation follow
+    // indirect calls, so retain the full IR for that execution model.
+    if module
+        .customs
+        .iter()
+        .any(|(_, section)| section.name() == "__wasm_bindgen_emscripten_marker")
+        || module
+            .imports
+            .iter()
+            .any(|import| import.module == "env" && import.name.starts_with("invoke_"))
+    {
+        return module.funcs.iter().map(|f| f.id()).collect();
+    }
+    let mut roots: Vec<_> = module
+        .exports
+        .iter()
+        .filter_map(|export| {
+            if export.name.starts_with("__wbindgen_describe") {
+                if let walrus::ExportItem::Function(id) = export.item {
+                    return Some(id);
+                }
+            }
+            None
+        })
+        .collect();
+    roots.extend(module.imports.iter().filter_map(|import| {
+        if import.name.starts_with("__wbindgen_describe") {
+            if let walrus::ImportKind::Function(id) = import.kind {
+                return Some(id);
+            }
+        }
+        None
+    }));
+    roots
 }
 
 fn reset_indentation(s: &str) -> String {
@@ -739,28 +802,41 @@ fn reset_indentation(s: &str) -> String {
 /// issue: <https://github.com/wasm-bindgen/wasm-bindgen/issues/4820>
 fn demangle(module: &mut Module) {
     let (lower, upper) = module.funcs.iter().size_hint();
-    let mut counter: HashMap<String, i32> = HashMap::with_capacity(upper.unwrap_or(lower));
+    let mut counter: HashMap<&str, i32> = HashMap::with_capacity(upper.unwrap_or(lower));
 
-    for func in module.funcs.iter_mut() {
-        let Some(name) = &func.name else {
-            continue;
-        };
-
-        let Ok(sym) = rustc_demangle::try_demangle(name) else {
-            continue;
-        };
-
-        let demangled = sym.to_string();
-        match counter.entry(demangled) {
+    let mut names: Vec<_> = module
+        .funcs
+        .par_iter()
+        .filter_map(|func| {
+            let name = func.name.as_ref()?;
+            let sym = rustc_demangle::try_demangle(name).ok()?;
+            Some((func.id(), sym.to_string()))
+        })
+        .collect();
+    // Keep collision suffixes identical to the serial arena traversal.
+    names.sort_unstable_by_key(|(id, _)| id.index());
+    // Borrow names while assigning suffixes, then move each unique String into
+    // its function instead of allocating another copy for the counter.
+    let suffixes: Vec<_> = names
+        .iter()
+        .map(|(_, name)| match counter.entry(name.as_str()) {
             Entry::Occupied(mut entry) => {
-                func.name = Some(format!("{}[{}]", entry.key(), entry.get()));
+                let suffix = *entry.get();
                 *entry.get_mut() += 1;
+                Some(suffix)
             }
             Entry::Vacant(entry) => {
-                func.name = Some(entry.key().clone());
                 entry.insert(1);
+                None
             }
-        }
+        })
+        .collect();
+    drop(counter);
+    for ((id, name), suffix) in names.into_iter().zip(suffixes) {
+        module.funcs.get_mut(id).name = Some(match suffix {
+            Some(index) => format!("{name}[{index}]"),
+            None => name,
+        });
     }
 }
 
@@ -1110,14 +1186,13 @@ fn gc_module_and_adapters(module: &mut Module) {
             .implements
             .retain(|pair| imports_remaining.contains(&pair.0));
 
-        // ... and after we delete the `implements` directive we try to
-        // delete some adapters themselves. If nothing is deleted, then we're
-        // good to go. If something is deleted though then we may have free'd up
-        // some functions in the main module to get deleted, so go again to gc
-        // things.
-        let any_removed = section.gc();
+        // Pruning adapters can only make core Wasm items unreachable when
+        // the set of roots they contribute changes. Removing a JS-only adapter,
+        // or one whose roots are still shared by live adapters, needs no second
+        // traversal of every instruction in the module.
+        let roots_changed = section.gc();
         module.customs.add(*section);
-        if !any_removed {
+        if !roots_changed {
             break;
         }
     }
@@ -1136,4 +1211,126 @@ where
     let mut pairs = map.iter().collect::<Vec<_>>();
     pairs.sort_by_key(|(k, _)| *k);
     pairs.into_iter()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_bodies_require_library_opt_in() {
+        let input = wat::parse_str(
+            r#"(module
+            (func $helper (result i32) i32.const 7)
+            (func (export "root") call $helper drop))"#,
+        )
+        .unwrap();
+        for enabled in [false, true] {
+            let mut bindgen = Bindgen::new();
+            bindgen.preserve_original_code_metadata(false);
+            if enabled {
+                bindgen.preserve_encoded_bodies(true);
+            }
+            let module = bindgen.module_from_bytes(&input).unwrap();
+            assert_eq!(
+                module
+                    .funcs
+                    .iter()
+                    .any(|f| matches!(f.kind, walrus::FunctionKind::Encoded(_))),
+                enabled
+            );
+        }
+    }
+
+    #[test]
+    fn emscripten_invoke_descriptors_keep_complete_instruction_ir() {
+        let input = wat::parse_str(
+            r#"(module
+            (import "env" "invoke_vi" (func (param i32 i32)))
+            (func $helper)
+            (func (export "root") call $helper))"#,
+        )
+        .unwrap();
+        let mut bindgen = Bindgen::new();
+        bindgen
+            .preserve_original_code_metadata(false)
+            .preserve_encoded_bodies(true);
+        let module = bindgen.module_from_bytes(&input).unwrap();
+        assert!(module
+            .funcs
+            .iter()
+            .all(|f| !matches!(f.kind, walrus::FunctionKind::Encoded(_))));
+    }
+
+    #[test]
+    fn parsed_metadata_is_preserved_for_library_callers() {
+        let input = wat::parse_str("(module (func (result i32) i32.const 42))").unwrap();
+        for preserve in [true, false] {
+            let mut bindgen = Bindgen::new();
+            if !preserve {
+                bindgen.preserve_original_code_metadata(false);
+            }
+            let module = bindgen.module_from_bytes(&input).unwrap();
+            let (_, function) = module.funcs.iter_local().next().unwrap();
+            assert_eq!(!function.instruction_mapping.is_empty(), preserve);
+        }
+    }
+
+    #[test]
+    fn debug_generation_overrides_library_metadata_opt_out() {
+        let input = wat::parse_str("(module (func (result i32) i32.const 42))").unwrap();
+        let mut bindgen = Bindgen::new();
+        bindgen
+            .preserve_original_code_metadata(false)
+            .keep_debug(true);
+        let module = bindgen.module_from_bytes(&input).unwrap();
+        assert!(!module
+            .funcs
+            .iter_local()
+            .next()
+            .unwrap()
+            .1
+            .instruction_mapping
+            .is_empty());
+    }
+
+    #[test]
+    fn collision_suffixes_follow_arena_order_across_thread_counts() {
+        let symbol = "_ZN3foo17h0123456789abcdefE";
+        let pretty = rustc_demangle::demangle(symbol).to_string();
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut module = Module::default();
+                    let ty = module.types.add(&[], &[]);
+                    let (import, _) = module.add_import_func("env", "foo", ty);
+                    module.funcs.get_mut(import).name = Some(symbol.into());
+                    let mut ids = vec![import];
+                    for _ in 0..128 {
+                        let id = walrus::FunctionBuilder::new(&mut module.types, &[], &[])
+                            .finish(vec![], &mut module.funcs);
+                        module.funcs.get_mut(id).name = Some(symbol.into());
+                        ids.push(id);
+                    }
+                    let plain = walrus::FunctionBuilder::new(&mut module.types, &[], &[])
+                        .finish(vec![], &mut module.funcs);
+                    module.funcs.get_mut(plain).name = Some("plain".into());
+                    demangle(&mut module);
+                    assert_eq!(
+                        module.funcs.get(import).name.as_deref(),
+                        Some(pretty.as_str())
+                    );
+                    for (index, id) in ids.into_iter().enumerate().skip(1) {
+                        assert_eq!(
+                            module.funcs.get(id).name.as_deref(),
+                            Some(format!("{pretty}[{index}]").as_str())
+                        );
+                    }
+                    assert_eq!(module.funcs.get(plain).name.as_deref(), Some("plain"));
+                });
+        }
+    }
 }

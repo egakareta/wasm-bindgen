@@ -587,8 +587,8 @@ impl NonstandardWitSection {
     /// Removes any dead entries in `adapters` that are no longer necessary
     /// and/or no longer referenced.
     ///
-    /// Returns `true` if any adapters were deleted, or `false` if the adapters
-    /// did not change.
+    /// Returns `true` if removing adapters changed the core Wasm GC roots.
+    /// Only then can another whole-module GC pass remove additional items.
     pub fn gc(&mut self) -> bool {
         // Populate the live set with the exports, implements directives, and
         // anything transitively referenced by those adapters.
@@ -602,9 +602,9 @@ impl NonstandardWitSection {
 
         // And now that we have the live set we can filter out our list of
         // adapter definitions.
-        let before = self.adapters.len();
+        let before = self.gc_roots();
         self.adapters.retain(|id, _| live.contains(id));
-        before != self.adapters.len()
+        before != self.gc_roots()
     }
 
     fn add_live(&self, id: AdapterId, live: &mut HashSet<AdapterId>) {
@@ -636,6 +636,37 @@ impl walrus::CustomSection for NonstandardWitSection {
     }
 
     fn add_gc_roots(&self, roots: &mut walrus::passes::Roots) {
+        self.for_each_gc_root(|root| match root {
+            GcRoot::Function(id) => {
+                roots.push_func(id);
+            }
+            GcRoot::Memory(id) => {
+                roots.push_memory(id);
+            }
+            GcRoot::Table(id) => {
+                roots.push_table(id);
+            }
+        });
+    }
+}
+
+#[derive(Eq, PartialEq, Hash)]
+enum GcRoot {
+    Function(walrus::FunctionId),
+    Memory(walrus::MemoryId),
+    Table(walrus::TableId),
+}
+
+impl NonstandardWitSection {
+    fn gc_roots(&self) -> HashSet<GcRoot> {
+        let mut roots = HashSet::new();
+        self.for_each_gc_root(|root| {
+            roots.insert(root);
+        });
+        roots
+    }
+
+    fn for_each_gc_root(&self, mut visit: impl FnMut(GcRoot)) {
         use Instruction::*;
 
         for adapter in self.adapters.values() {
@@ -645,14 +676,14 @@ impl walrus::CustomSection for NonstandardWitSection {
             };
             visit_instructions(instrs, &mut |instr| match instr.instr {
                 DeferFree { free: f, .. } => {
-                    roots.push_func(f);
+                    visit(GcRoot::Function(f));
                 }
                 StoreRetptr { mem, .. }
                 | LoadRetptr { mem, .. }
                 | View { mem, .. }
                 | OptionView { mem, .. }
                 | MemoryToString(mem) => {
-                    roots.push_memory(mem);
+                    visit(GcRoot::Memory(mem));
                 }
                 VectorToMemory {
                     malloc, free, mem, ..
@@ -663,23 +694,23 @@ impl walrus::CustomSection for NonstandardWitSection {
                 | MutableSliceToMemory {
                     malloc, free, mem, ..
                 } => {
-                    roots.push_memory(mem);
-                    roots.push_func(malloc);
-                    roots.push_func(free);
+                    visit(GcRoot::Memory(mem));
+                    visit(GcRoot::Function(malloc));
+                    visit(GcRoot::Function(free));
                 }
                 EncodedSliceStore {
                     malloc, free, mem, ..
                 } => {
-                    roots.push_memory(mem);
-                    roots.push_func(malloc);
-                    roots.push_func(free);
+                    visit(GcRoot::Memory(mem));
+                    visit(GcRoot::Function(malloc));
+                    visit(GcRoot::Function(free));
                 }
                 VectorLoad { free, mem, .. }
                 | OptionVectorLoad { free, mem, .. }
                 | EncodedSliceLoad { free, mem, .. }
                 | CachedStringLoad { free, mem, .. } => {
-                    roots.push_memory(mem);
-                    roots.push_func(free);
+                    visit(GcRoot::Memory(mem));
+                    visit(GcRoot::Function(free));
                 }
                 OptionString {
                     mem,
@@ -694,28 +725,79 @@ impl walrus::CustomSection for NonstandardWitSection {
                     free,
                     realloc,
                 } => {
-                    roots.push_memory(mem);
-                    roots.push_func(malloc);
-                    roots.push_func(free);
+                    visit(GcRoot::Memory(mem));
+                    visit(GcRoot::Function(malloc));
+                    visit(GcRoot::Function(free));
                     if let Some(id) = realloc {
-                        roots.push_func(id);
+                        visit(GcRoot::Function(id));
                     }
                 }
                 I32FromOptionExternref {
                     table_and_alloc: Some((table, alloc)),
                     ..
                 } => {
-                    roots.push_table(table);
-                    roots.push_func(alloc);
+                    visit(GcRoot::Table(table));
+                    visit(GcRoot::Function(alloc));
                 }
                 UnwrapResult { table_and_drop } | UnwrapResultString { table_and_drop } => {
                     if let Some((table, drop)) = table_and_drop {
-                        roots.push_table(table);
-                        roots.push_func(drop);
+                        visit(GcRoot::Table(table));
+                        visit(GcRoot::Function(drop));
                     }
                 }
                 _ => {}
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    fn fixture(shared_root: bool) -> NonstandardWitSection {
+        let mut module = walrus::Module::default();
+        let ty = module.types.add(&[], &[]);
+        let (first, import) = module.add_import_func("env", "first", ty);
+        let (second, _) = module.add_import_func("env", "second", ty);
+        let mut section = NonstandardWitSection::default();
+        for (index, free) in [first, if shared_root { first } else { second }]
+            .into_iter()
+            .enumerate()
+        {
+            let id = AdapterId(index);
+            section.adapters.insert(
+                id,
+                Adapter {
+                    id,
+                    params: vec![],
+                    results: vec![],
+                    inner_results: vec![],
+                    kind: AdapterKind::Local {
+                        instructions: vec![InstructionData {
+                            instr: Instruction::DeferFree { free, align: 1 },
+                            stack_change: StackChange::Unknown,
+                        }],
+                    },
+                },
+            );
+        }
+        section.implements.push((import, first, AdapterId(0)));
+        section
+    }
+
+    #[test]
+    fn deleting_shared_root_adapter_needs_no_second_wasm_gc() {
+        let mut section = fixture(true);
+        assert!(!section.gc());
+        assert_eq!(section.adapters.len(), 1);
+    }
+
+    #[test]
+    fn deleting_unique_root_adapter_requires_another_wasm_gc() {
+        let mut section = fixture(false);
+        assert!(section.gc());
+        assert_eq!(section.adapters.len(), 1);
+        assert!(!section.gc());
     }
 }
