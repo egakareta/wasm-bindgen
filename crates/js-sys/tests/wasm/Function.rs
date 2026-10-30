@@ -839,3 +839,48 @@ fn for_each_with_closure_conversion() {
     assert_eq!(results[1], ("banana".to_string(), 1));
     assert_eq!(results[2], ("cherry".to_string(), 2));
 }
+
+// A signature slot may be a converted carrier such as `Nullable<T>`, not
+// only a handle, so a `Closure` over one makes a typed `Function`.
+#[wasm_bindgen_test]
+fn nullable_signature() {
+    let closure: Closure<dyn FnMut(Nullable<JsString>) -> Option<Number>> =
+        Closure::new(|s: Nullable<JsString>| s.value().map(|s| Number::from(s.length())));
+    let f: Function<fn(Nullable<JsString>) -> Option<Number>> = Function::from_closure(closure);
+    assert_eq!(f.len(), 1);
+    let f: Function = f.unchecked_into();
+    assert_eq!(
+        f.call1(&JsValue::NULL, &JsValue::NULL).unwrap(),
+        JsValue::UNDEFINED
+    );
+    assert_eq!(f.call1(&JsValue::NULL, &"ab".into()).unwrap(), 2);
+}
+
+// `undefined` is a value of `Option<T>`, so a function stands in for one that
+// also takes a trailing optional argument, which it simply ignores.
+#[wasm_bindgen_test]
+fn upcast_extends_with_trailing_option() {
+    use wasm_bindgen::prelude::Upcast;
+
+    let f: Function<fn(JsString) -> Number> = Function::new_with_args_typed("s", "return s.length");
+    let g: Function<fn(JsString, Option<Number>) -> Number> = f.upcast_into();
+    let g: Function = g.unchecked_into();
+    assert_eq!(
+        g.call2(&JsValue::NULL, &"ab".into(), &JsValue::UNDEFINED)
+            .unwrap(),
+        2
+    );
+}
+
+// A function that handles `None` accepts any value of its payload, so a
+// function taking `Option<T>` stands in for one taking `T`.
+#[wasm_bindgen_test]
+fn upcast_accepts_option_for_payload() {
+    use wasm_bindgen::prelude::Upcast;
+
+    let f: Function<fn(Option<JsString>) -> Number> =
+        Function::new_with_args_typed("s", "return s === undefined ? -1 : s.length");
+    let g: Function<fn(JsString) -> Number> = f.upcast_into();
+    let g: Function = g.unchecked_into();
+    assert_eq!(g.call1(&JsValue::NULL, &"abc".into()).unwrap(), 3);
+}

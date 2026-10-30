@@ -5,6 +5,23 @@
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+## [0.2.130](https://github.com/wasm-bindgen/wasm-bindgen/compare/0.2.129...0.2.130)
+
+### Added
+
+* A borrowed number, `bool`, `char` or borrowed string crosses by copy, so
+  `&f64`, `&Option<T>`, `&Nullable<T>`, `Option<&f64>` and
+  `Option<&Nullable<T>>` are argument types, and an
+  `experimental_generic_mono` import taking `&T` accepts `T = f64`,
+  `Option<f64>` or `Nullable<String>`, as std's `contains(&T)` does.
+  [#5436](https://github.com/wasm-bindgen/wasm-bindgen/pull/5436)
+
 * Added a rejection type parameter to `js_sys::Promise<T, E = JsValue>`,
   mirrored on `JsFuture<T, E>`, `PromiseState<T, E>` and
   `PromiseWithResolvers<T, E>`. Awaiting a `Promise<T, E>` yields
@@ -50,6 +67,28 @@
   and `Nullable<T>` erases like `Option<T>` on a generic import.
   [#5410](https://github.com/wasm-bindgen/wasm-bindgen/pull/5410)
   [#5423](https://github.com/wasm-bindgen/wasm-bindgen/pull/5423)
+
+* `Nullable<T>` converts into `JsValue` with `From`, `Null` becoming `null`
+  as `None` becomes `undefined` for `Option<T>`, and `Option<T>`,
+  `Nullable<T>` and `Result<T, E>` are `Promising` for any `T: Promising`,
+  so a `Promise<Nullable<JsString>>` awaits to a `Nullable<JsString>`.
+  `String` and `&str` upcast to `JsValue`, and `String` to itself, so a
+  `Promise<String>` from an `experimental_generic_mono` import is `JsGeneric`
+  and upcasts to `Promise<JsValue>` as `Promise<bool>` does. Together these
+  make a `Promise<Nullable<JsString>>` or `Promise<String>` from a mono
+  import usable wherever a promise is expected. `&str` and `String` upcast to
+  each other, so an `Array<&str>` inferred from borrowed arguments settles to
+  `Array<String>`. `Option<T>` and `Nullable<T>` upcast to `JsValue` whenever
+  `T` does, so a `Promise<Option<String>>` relabels to `Promise<JsValue>`, and
+  `Undefined` and `Null` upcast to `Option<T>` and `Null` to `Nullable<T>`, so a
+  `Function<fn(A) -> R>` stands in for a `Function<fn(A, Option<B>) -> R>`.
+  Every Rust and JS carrier wraps into `Option<Target>` and `Nullable<Target>`
+  whenever it upcasts to `Target`, and `Nullable<T>` upcasts to `Option<T>`,
+  so an `Array<JsString>` relabels to `Array<Option<JsString>>` or
+  `Array<Option<Nullable<JsString>>>`, and a `Function<fn(Option<T>) -> R>`
+  stands in for a `Function<fn(T) -> R>`.
+  [#5427](https://github.com/wasm-bindgen/wasm-bindgen/pull/5427)
+  [#5437](https://github.com/wasm-bindgen/wasm-bindgen/pull/5437)
 
 * Added `MaybeIntoWasmAbi` / `MaybeFromWasmAbi`, the ABI of `Option<T>` for
   every `T`, with an associated `MaybeAbi` that lets a type without a spare
@@ -111,6 +150,9 @@
   out of the JavaScript object, which throws on any later use.
   [#5354](https://github.com/wasm-bindgen/wasm-bindgen/pull/5354)
 
+* Added Rolldown compatibility to the deployment docs in the guide.
+  [#5355](https://github.com/wasm-bindgen/wasm-bindgen/pull/5355)
+
 * Added `source` property to ToggleEvent.
   [#5353](https://github.com/wasm-bindgen/wasm-bindgen/pull/5353)
 
@@ -164,6 +206,73 @@
   [#5421](https://github.com/wasm-bindgen/wasm-bindgen/pull/5421)
 
 ### Changed
+
+* Reworked the `js_sys::Temporal` bindings and `Date::to_temporal_instant`,
+  which stay behind `js_sys_unstable_apis` and now also need the new `temporal`
+  feature, against the final Stage 4
+  specification and reshaped them to the web-sys conventions. Inputs are
+  typed: `*Like` dictionaries such as `PlainDateLike` for `from`, calendar-free
+  `*Fields` dictionaries for `with`, and the bare form of a method takes the
+  type its argument converts to (`&str` time zones and calendars, `&PlainTime`,
+  `&Duration`, `&Self` for `until`/`since`/`equals`), while every other member
+  of a specification union gets a `_with_<type>` variant, so
+  `with_calendar_with_plain_date`, `add_with_duration_like`, `add_with_str`,
+  `equals_with_zoned_date_time`, `with_plain_time_with_str`,
+  `PlainYearMonth::from_with_plain_date` and the typed `relativeTo`, `calendar`,
+  `timeZone` and `plainTime` dictionary setters all exist; `compare` keeps
+  taking `&Self` only. Optional arguments expand to the plain method plus
+  `_with_options`/`_and_options`, `to_locale_string` takes no locale, a
+  `_with_str`/`_with_str_sequence` one or an `Option<&str>` with options, and `round`,
+  `total` and `get_time_zone_transition` take their options dictionary, with
+  `round_with_unit`, `total_with_unit` and
+  `get_time_zone_transition_with_direction` shortcuts. The option dictionaries
+  are `OverflowOptions`, `DifferenceOptions`, `RoundToOptions::new(unit)`,
+  `DurationTotalOptions::new(unit)`, `TimeZoneTransitionOptions::new(direction)`
+  and friends, the enums drop their `Temporal` prefix (`Overflow`, `Unit`,
+  `LargestUnit`, `TransitionDirection`, …). Bindings for the removed
+  `toPlainYearMonth`/`toPlainMonthDay` on `PlainDateTime` and `ZonedDateTime`,
+  `ZonedDateTime::with_plain_date` and `PlainTime::to_plain_date_time` are gone,
+  `offset_nanoseconds` returns `f64`, `era`, `era_year`, `week_of_year` and
+  `year_of_week` return `Option`s, `fractionalSecondDigits` is a `u8`,
+  `get_time_zone_transition` returns `Nullable<ZonedDateTime>`,
+  `to_js_string_with_options` and `to_locale_string` are fallible, constructors
+  expand their optional trailing fields (`PlainTime::new()`, `new_with_hour`, …,
+  `PlainDate::new_with_calendar`), and `catch` follows the specification:
+  `equals`, `compare`, the typed `from` forms (except `PlainYearMonth`'s date
+  conversions, which can leave the range) and the option-less
+  `Instant`/`PlainTime` arithmetic are infallible, while
+  `ZonedDateTime::start_of_day`, `hours_in_day` and
+  `PlainDate::to_plain_year_month` are fallible. Fallible bindings return
+  `Result<T, RangeError>`, or `Result<T, Error>` where a property bag, a
+  `relativeTo`/`plainTime` union or `Intl` options can also throw a `TypeError`. `PartialEq`/`Eq` on the
+  date-time types compare by the spec `equals()`, and `Instant` and `PlainTime`
+  are `Ord` through `compare()`.
+  [#5402](https://github.com/wasm-bindgen/wasm-bindgen/pull/5402)
+
+* The js-sys `JsFunction*` traits' associated types (`Ret`, `ArgN`, `BindN`)
+  no longer carry a `JsGeneric` bound, so a `Function<fn(..)>` signature may
+  name a converted carrier such as `Nullable<JsString>`, and
+  `Function::from_closure` accepts a closure with converted arguments. Generic
+  code over these traits that calls `call*` or `bind*` now needs the bound
+  itself, as `where F::Ret: JsGeneric, F::Arg1: JsGeneric`. The hidden
+  `PromiseTuple` trait's `Joined` and `Settled` likewise drop it, its
+  Rust-tuple impl packing the promise handles directly rather than upcasting
+  each, and the
+  `JsGeneric` bounds that only existed to satisfy a `Function<fn(..)>` slot
+  or to tag a type argument are gone: `Promising for Promise<T, E>`,
+  `Promise::new_typed`, the `PromiseWithResolvers` `resolve`/`reject`
+  getters, the `PropertyDescriptor` `get`/`set` accessors, `WeakMap::new` and
+  the `entries`/`from_entries` family of `Array`, `Set`, `Map` and `Object`.
+  [#5427](https://github.com/wasm-bindgen/wasm-bindgen/pull/5427)
+
+* `Option<T>: TryFromJsValue` now reads `null` as `None`, as the `Option<T>`
+  ABI does, so `Option::<JsValue>::try_from_js_value(JsValue::NULL)` is
+  `None` where it was `Some(null)`. A `T` that accepts `null` as a distinct
+  value space sets the new `TryFromJsValue::NULLABLE` const, as
+  `Nullable<T>` does, and an `Option` of it passes `null` through, so
+  `Option<Nullable<T>>` reads it as `Some(Nullable::Null)`. `Nullable<T>`
+  itself converts from a `JsValue` with `TryFromJsValue`.
+  [#5427](https://github.com/wasm-bindgen/wasm-bindgen/pull/5427)
 
 * With reference types, `static_string` constants and the reserved
   `undefined`, `null`, `true` and `false` values are stored at fixed slots of
@@ -246,6 +355,21 @@
   [#5384](https://github.com/wasm-bindgen/wasm-bindgen/pull/5384)
 
 ### Fixed
+
+* `Upcast::upcast` and `upcast_into` no longer let a safe `UpcastFrom` impl
+  extend a borrow's lifetime: `ErasableGeneric::Repr` now keeps the real
+  lifetime of a reference, slice, `&str`, closure reference or
+  `ScopedClosure` instead of `'static`, so the `Repr`-equality bound rejects
+  such an upcast. A generic import likewise no longer accepts an owned
+  `ScopedClosure` that borrows a non-`'static` value, which handed JS a
+  closure over freed data; borrowed arguments, and owned ones that only
+  contain a borrow, still accept any lifetime.
+  [#5178](https://github.com/wasm-bindgen/wasm-bindgen/pull/5178)
+
+* Concurrent calls to the `web` and `no-modules` init function no longer
+  instantiate the module more than once; later calls share the in-flight
+  initialization and resolve to the same instance.
+  [#5429](https://github.com/wasm-bindgen/wasm-bindgen/pull/5429)
 
 * `js_sys::Promise::catch_map`'s handler now receives the rejection reason,
   typed as the promise's `E`, instead of the reason mislabelled as the
@@ -388,7 +512,9 @@
   numeric suffix in the JS, while the TypeScript definitions keep their name.
   [#3729](https://github.com/wasm-bindgen/wasm-bindgen/issues/3729)
 
-### Removed
+* Getters generated by `getter_with_clone` no longer trigger the
+  `clippy::clone_on_copy` lint.
+  [#5363](https://github.com/wasm-bindgen/wasm-bindgen/pull/5363)
 
 ## [0.2.129](https://github.com/wasm-bindgen/wasm-bindgen/compare/0.2.128...0.2.129)
 
