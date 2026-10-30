@@ -1,14 +1,19 @@
 use js_sys::{JsNullable, JsOption, Null, Undefined};
-use js_sys::{JsString, Number, Object};
-use wasm_bindgen::convert::Upcast;
+use js_sys::{JsString, Number, Object, Promise};
+use wasm_bindgen::convert::{RefIntoWasmAbi, Upcast};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 
 #[wasm_bindgen(inline_js = "
 export const js_optional_default = (value = 42) => value;
 export const js_nullable_echo = (value) => value;
+export const js_nullable_await = (p) => p;
 ")]
 extern "C" {
+    // `Nullable<T>` is `Promising`, so a `Promise<Nullable<T>>` awaits to it.
+    #[wasm_bindgen(js_name = js_nullable_await)]
+    async fn js_nullable_await(p: &Promise<Nullable<JsString>>) -> Nullable<JsString>;
+
     // Imported with an erasable generic param.
     #[wasm_bindgen(js_name = js_optional_default)]
     fn js_optional_default_generic<T>(value: JsOption<T>) -> T;
@@ -16,6 +21,17 @@ extern "C" {
     // `Nullable<T>` erases to `Nullable<JsValue>` as `Option<T>` does.
     #[wasm_bindgen(js_name = js_nullable_echo)]
     fn js_nullable_echo_generic<T>(value: Nullable<T>) -> Nullable<T>;
+
+    // A borrowed scalar crosses by copy, as generic code borrowing an element
+    // (`contains(&T)`) needs for every `T`.
+    #[wasm_bindgen(js_name = js_nullable_echo)]
+    fn js_echo_ref_f64(v: &f64) -> f64;
+    #[wasm_bindgen(js_name = js_nullable_echo)]
+    fn js_echo_ref_opt_f64(v: &Option<f64>) -> JsValue;
+    #[wasm_bindgen(js_name = js_nullable_echo)]
+    fn js_echo_opt_ref_nullable_string(v: Option<&Nullable<String>>) -> JsValue;
+    #[wasm_bindgen(experimental_generic_mono, js_name = js_nullable_echo)]
+    fn js_echo_mono_ref<T: RefIntoWasmAbi>(v: &T) -> JsValue;
 
     // Same JS function but with a concrete Option<i32> param.
     // Both should have the same observable behaviour.
@@ -637,4 +653,33 @@ fn erased_generic_nullable() {
     assert!(js_nullable_echo_generic(Nullable::<Number>::Null).is_null());
     let s: Nullable<JsString> = js_nullable_echo_generic(Nullable::Value(JsString::from("x")));
     assert_eq!(s.unwrap(), "x");
+}
+
+#[wasm_bindgen_test]
+async fn await_nullable_promise() {
+    let p: Promise<Nullable<JsString>> = Promise::resolve(&JsValue::NULL).unchecked_into();
+    assert_eq!(js_nullable_await(&p).await, Nullable::Null);
+    let p: Promise<Nullable<JsString>> = Promise::resolve(&JsString::from("a")).unchecked_into();
+    assert_eq!(
+        js_nullable_await(&p).await,
+        Nullable::Value(JsString::from("a"))
+    );
+}
+
+#[wasm_bindgen_test]
+fn borrowed_by_copy() {
+    assert_eq!(js_echo_ref_f64(&1.5), 1.5);
+    assert_eq!(js_echo_ref_opt_f64(&Some(1.5)), 1.5);
+    assert!(js_echo_ref_opt_f64(&None).is_undefined());
+    assert!(js_echo_opt_ref_nullable_string(None).is_undefined());
+    assert!(js_echo_opt_ref_nullable_string(Some(&Nullable::Null)).is_null());
+    assert_eq!(
+        js_echo_opt_ref_nullable_string(Some(&Nullable::Value("a".to_string()))),
+        "a"
+    );
+    assert_eq!(js_echo_mono_ref(&1.5), 1.5);
+    assert_eq!(js_echo_mono_ref(&true), true);
+    assert_eq!(js_echo_mono_ref(&Some(2.5)), 2.5);
+    assert!(js_echo_mono_ref(&Nullable::<f64>::Null).is_null());
+    assert_eq!(js_echo_mono_ref(&"a"), "a");
 }
